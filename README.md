@@ -39,18 +39,15 @@ uv pip install -r requirements.txt
 
 ### Recommended: build a standalone `.app`
 
-So macOS permissions attach to *the app itself* instead of to whatever terminal launched the script. Build with [py2app](https://py2app.readthedocs.io/) and drop into `/Applications`:
+So macOS permissions attach to *the app itself* instead of to whatever terminal launched the script. There's a one-shot installer:
 
 ```bash
-uv pip install py2app
-rm -rf build dist
-uv run python setup.py py2app          # ~770 MB output, ~5–10 min
-mv "dist/Voice Transcriber for EN-KR.app" /Applications/
-xattr -cr "/Applications/Voice Transcriber for EN-KR.app"
-open "/Applications/Voice Transcriber for EN-KR.app"
+./install.sh
 ```
 
-For faster iteration on the bundle config, use `uv run python setup.py py2app -A` (alias mode — symlinks back to your venv, no copy). Alias mode is ideal for `Info.plist` debugging, but the real bundle is what you'd install for daily use.
+That script verifies prerequisites (Apple Silicon, Homebrew, `uv`, `portaudio`, `ffmpeg`), creates the venv if needed, installs requirements + py2app, builds the bundle, copies it to `/Applications`, strips the macOS quarantine flag, resets stale TCC grants, and launches the app. Re-running it cleanly rebuilds and reinstalls — safe to run any time you change `app.py`.
+
+For faster iteration on the bundle config, run `uv run python setup.py py2app -A` directly (alias mode — symlinks back to your venv, no copy). Alias mode is ideal for `Info.plist` debugging.
 
 #### Granting bundle permissions
 
