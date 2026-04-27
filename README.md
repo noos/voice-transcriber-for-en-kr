@@ -37,21 +37,57 @@ uv venv --python 3.12
 uv pip install -r requirements.txt
 ```
 
-### Optional: build a standalone `.app`
+### Recommended: build a standalone `.app`
 
-If you'd rather have macOS permissions attached to the app itself (instead of to your terminal), build a `.app` bundle with py2app and drop it into `/Applications`:
+So macOS permissions attach to *the app itself* instead of to whatever terminal launched the script. Build with [py2app](https://py2app.readthedocs.io/) and drop into `/Applications`:
 
 ```bash
 uv pip install py2app
 rm -rf build dist
-uv run python setup.py py2app          # ~5 GB output, takes a few minutes
+uv run python setup.py py2app          # ~770 MB output, ~5–10 min
 mv "dist/Voice Transcriber for EN-KR.app" /Applications/
 xattr -cr "/Applications/Voice Transcriber for EN-KR.app"
+open "/Applications/Voice Transcriber for EN-KR.app"
 ```
 
-Then launch from Spotlight or `/Applications`. macOS will prompt for Microphone the first time; add the bundle to `System Settings → Privacy & Security → {Accessibility, Input Monitoring}` manually.
+For faster iteration on the bundle config, use `uv run python setup.py py2app -A` (alias mode — symlinks back to your venv, no copy). Alias mode is ideal for `Info.plist` debugging, but the real bundle is what you'd install for daily use.
 
-For faster iteration on the bundle config, use `uv run python setup.py py2app -A` (alias mode — symlinks back to your venv, no multi-GB copy).
+#### Granting bundle permissions
+
+The app needs four TCC permissions:
+
+1. **Microphone** — auto-prompted the first time you record
+2. **Accessibility** — `System Settings → Privacy & Security → Accessibility` → `+` → add `/Applications/Voice Transcriber for EN-KR.app`
+3. **Input Monitoring** — same panel, same procedure
+4. **Automation** (`System Events`) — auto-prompted the first time the app pastes; appears as *"Voice Transcriber wants access to control System Events"*
+
+After granting Accessibility/Input Monitoring, **quit and re-launch** the bundle so `pynput` picks up the new grants.
+
+#### Bundling gotchas (already handled in `setup.py`)
+
+These are baked into [setup.py](setup.py); listed for reference if you fork:
+
+- `sys.setrecursionlimit(5000)` — py2app's modulegraph blows the default stack on torch/scipy/numba's import tree.
+- An empty `mlx/__init__.py` is created at build time — `mlx` is a PEP 420 namespace package and py2app's `imp.find_module` can't discover it otherwise.
+- A stub file is pointed to as `zlib.__file__` — uv-managed Python statically links zlib, so it has no `__file__` and py2app crashes when it tries to copy "the zlib library".
+- [app.py](app.py) prepends `/opt/homebrew/bin` and `/usr/local/bin` to `PATH` at import time so the bundled subprocess can find `ffmpeg` and `osascript`.
+- [app.py](app.py) redirects `sys.stdout`/`sys.stderr` to `~/Library/Logs/voice-transcriber.log` (UTF-8) so the otherwise-discarded `print()` output survives the bundle launcher. **This log is your debug trail** — if anything misbehaves in the bundle, `cat ~/Library/Logs/voice-transcriber.log` is the first place to look.
+
+#### Re-builds invalidate permissions
+
+Each `setup.py py2app` run produces a new ad-hoc signature, and macOS TCC keys grants on bundle ID **plus** signature hash. Every rebuild therefore orphans your previous grants. The cleanest reset is:
+
+```bash
+tccutil reset All com.noos.voicetranscriberenkr
+```
+
+…then re-add the bundle to the three permission panels above.
+
+#### Still required on the host
+
+The bundle does **not** include `ffmpeg` or `portaudio` — both are loaded from system locations. Anyone who installs the `.app` still needs Homebrew + `brew install portaudio ffmpeg` on their machine. Bundling those is a future improvement.
+
+### Source-only run (no `.app`)
 
 ## Run
 
@@ -61,17 +97,11 @@ uv run python -u app.py
 
 The 🎤 icon appears in the macOS menu bar. The terminal stays attached for log output (`-u` keeps it unbuffered). On first launch the active model is downloaded from HuggingFace (~1.5 GB for Whisper Turbo, ~2.5 GB for Parakeet) — only fetched the first time you select that profile.
 
-### macOS permissions
+### macOS permissions when running from source
 
-The app needs three permissions:
+The script needs Microphone, Accessibility, Input Monitoring (and Automation, for the `osascript` paste). Grant them to the **terminal app you launch the script from** (Ghostty, iTerm, Terminal.app, VS Code, etc.) — not to the Python binary itself. The uv-managed Python binary at `~/.local/share/uv/python/cpython-3.12.*/bin/python3.12` is unsigned and macOS won't let you add it to Accessibility/Input Monitoring (greyed out in the file picker). The child Python process inherits its parent terminal's grants.
 
-- **Microphone** — for `pyaudio` to capture audio
-- **Accessibility** — for `pynput` to listen to the global hotkey and for `pyautogui` to send the paste keystroke
-- **Input Monitoring** — same reason
-
-Grant them to the **terminal app you launch the script from** (Ghostty, iTerm, Terminal.app, VS Code, etc.) — not to the Python binary itself. The uv-managed Python binary at `~/.local/share/uv/python/cpython-3.12.*/bin/python3.12` is unsigned and macOS will not let you add it to Accessibility/Input Monitoring at all (it shows up greyed out in the file picker). The child Python process inherits the permissions of its parent terminal, which is enough.
-
-Add the terminal under `System Settings → Privacy & Security → {Accessibility, Input Monitoring, Microphone}`. If you switch terminals, you'll need to grant the new one as well.
+If you switch terminals, you'll need to re-grant the new one. **This is exactly the over-broad-permission situation the bundled `.app` (above) avoids** — recommend installing the bundle for daily use.
 
 ## Usage
 

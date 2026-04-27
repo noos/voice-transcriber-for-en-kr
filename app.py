@@ -1,11 +1,35 @@
+import os
+import sys
+from pathlib import Path
+
+# Bundled .app inherits a stripped PATH (just /usr/bin:/bin) and can't find
+# Homebrew binaries like ffmpeg. mlx_whisper and parakeet_mlx both shell out
+# to ffmpeg to decode the captured WAV; without this prepend we get
+# "FFmpeg is not installed or not in your PATH" at transcribe time.
+os.environ["PATH"] = ":".join([
+    "/opt/homebrew/bin",  # Apple Silicon brew
+    "/usr/local/bin",     # Intel brew (harmless on AS)
+    os.environ.get("PATH", "/usr/bin:/bin"),
+])
+
+# Bundled .app drops stdout/stderr to /dev/null. Redirect to a log file so
+# transcribe/warmup/silence-guard prints survive the launcher.
+_LOG_PATH = Path.home() / "Library" / "Logs" / "voice-transcriber.log"
+try:
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _log_file = open(_LOG_PATH, "a", buffering=1, encoding="utf-8", errors="replace")
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+    print(f"\n=== app start pid={os.getpid()} ===", flush=True)
+except Exception:
+    pass
+
 import rumps
 import pyaudio
 import threading
 import tempfile
 import wave
 import json
-import os
-from pathlib import Path
 import queue
 import subprocess
 import traceback
@@ -641,16 +665,39 @@ class VoiceRecorderApp(rumps.App):
 
                 # 붙여넣기 — pyautogui.hotkey는 macOS에서 modifier가 누락되어
                 # 'v'만 입력되는 버그가 있어 osascript(System Events)로 대체.
+                # bundled .app에서는 stdout이 /dev/null이라, 결과를 파일로도 남긴다.
                 def do_paste():
+                    log_path = Path.home() / "Library" / "Logs" / "voice-transcriber.log"
                     try:
-                        subprocess.run(
-                            ["osascript", "-e",
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        r = subprocess.run(
+                            ["/usr/bin/osascript", "-e",
                              'tell application "System Events" to keystroke "v" using command down'],
-                            check=True,
-                            timeout=2,
+                            capture_output=True, text=True, check=False, timeout=3,
                         )
-                        print("[transcribe] pasted", flush=True)
+                        try:
+                            with log_path.open("a") as f:
+                                from datetime import datetime
+                                f.write(f"{datetime.now().isoformat()} paste rc={r.returncode} "
+                                        f"stdout={r.stdout!r} stderr={r.stderr!r}\n")
+                        except Exception:
+                            pass
+                        if r.returncode == 0:
+                            print("[transcribe] pasted", flush=True)
+                        else:
+                            print(f"[transcribe] paste rc={r.returncode}: {r.stderr.strip()}", flush=True)
+                            self._notify("붙여넣기 오류", "",
+                                         (r.stderr or f"rc={r.returncode}").strip()[:120])
                     except Exception as e:
+                        try:
+                            with log_path.open("a") as f:
+                                from datetime import datetime
+                                f.write(f"{datetime.now().isoformat()} paste EXC {type(e).__name__}: {e}\n")
+                        except Exception:
+                            pass
                         print(f"[transcribe] paste error: {e}", flush=True)
                         self._notify("붙여넣기 오류", "", str(e)[:120])
 
