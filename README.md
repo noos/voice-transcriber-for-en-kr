@@ -1,6 +1,8 @@
-# mlx-whisper
+# Voice Transcriber for EN-KR
 
 A macOS menu bar voice-to-text app powered by MLX. Hold or tap a hotkey, speak, and the transcription is pasted into whatever window has focus.
+
+Originally forked from [borinomi/mlx-whisper](https://github.com/borinomi/mlx-whisper); reworked for reliability (audio device hot-swap, silence guards, osascript paste, profile-based language/model bundling) and packaged as a standalone `.app` so macOS permissions attach to the app itself rather than to whatever terminal launched it.
 
 Two transcription engines are bundled and selectable from the menu bar via "profiles":
 
@@ -29,11 +31,27 @@ brew install portaudio ffmpeg
 ## Install
 
 ```bash
-git clone https://github.com/borinomi/mlx-whisper
-cd mlx-whisper
+git clone https://github.com/noos/voice-transcriber-for-en-kr
+cd voice-transcriber-for-en-kr
 uv venv --python 3.12
 uv pip install -r requirements.txt
 ```
+
+### Optional: build a standalone `.app`
+
+If you'd rather have macOS permissions attached to the app itself (instead of to your terminal), build a `.app` bundle with py2app and drop it into `/Applications`:
+
+```bash
+uv pip install py2app
+rm -rf build dist
+uv run python setup.py py2app          # ~5 GB output, takes a few minutes
+mv "dist/Voice Transcriber for EN-KR.app" /Applications/
+xattr -cr "/Applications/Voice Transcriber for EN-KR.app"
+```
+
+Then launch from Spotlight or `/Applications`. macOS will prompt for Microphone the first time; add the bundle to `System Settings → Privacy & Security → {Accessibility, Input Monitoring}` manually.
+
+For faster iteration on the bundle config, use `uv run python setup.py py2app -A` (alias mode — symlinks back to your venv, no multi-GB copy).
 
 ## Run
 
