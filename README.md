@@ -45,13 +45,15 @@ The 🎤 icon appears in the macOS menu bar. The terminal stays attached for log
 
 ### macOS permissions
 
-The first time you run the app, macOS will prompt for:
+The app needs three permissions:
 
 - **Microphone** — for `pyaudio` to capture audio
-- **Accessibility** — for `pynput` to listen to the global hotkey
+- **Accessibility** — for `pynput` to listen to the global hotkey and for `pyautogui` to send the paste keystroke
 - **Input Monitoring** — same reason
 
-Permissions are granted to the binary that's *actually* running, which is the uv-managed Python at `~/.local/share/uv/python/cpython-3.12.*/bin/python3.12`, not your terminal app. If macOS doesn't auto-prompt, add it manually under `System Settings → Privacy & Security → {Accessibility, Input Monitoring}`.
+Grant them to the **terminal app you launch the script from** (Ghostty, iTerm, Terminal.app, VS Code, etc.) — not to the Python binary itself. The uv-managed Python binary at `~/.local/share/uv/python/cpython-3.12.*/bin/python3.12` is unsigned and macOS will not let you add it to Accessibility/Input Monitoring at all (it shows up greyed out in the file picker). The child Python process inherits the permissions of its parent terminal, which is enough.
+
+Add the terminal under `System Settings → Privacy & Security → {Accessibility, Input Monitoring, Microphone}`. If you switch terminals, you'll need to grant the new one as well.
 
 ## Usage
 
