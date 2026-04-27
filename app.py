@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import subprocess
 import traceback
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 import mlx_whisper
 import numpy as np
 import pyperclip
-import pyautogui
 from pynput import keyboard
 
 LANG_BADGE = {"ko": "KR", "en": "EN"}
@@ -639,10 +639,16 @@ class VoiceRecorderApp(rumps.App):
                 pyperclip.copy(text)
                 print("[transcribe] copied to clipboard", flush=True)
 
-                # 붙여넣기 (메인루프에서 실행하는 게 더 안전)
+                # 붙여넣기 — pyautogui.hotkey는 macOS에서 modifier가 누락되어
+                # 'v'만 입력되는 버그가 있어 osascript(System Events)로 대체.
                 def do_paste():
                     try:
-                        pyautogui.hotkey("command", "v")
+                        subprocess.run(
+                            ["osascript", "-e",
+                             'tell application "System Events" to keystroke "v" using command down'],
+                            check=True,
+                            timeout=2,
+                        )
                         print("[transcribe] pasted", flush=True)
                     except Exception as e:
                         print(f"[transcribe] paste error: {e}", flush=True)
