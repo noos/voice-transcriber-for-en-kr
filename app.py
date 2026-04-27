@@ -11,6 +11,7 @@ import traceback
 import time
 
 import mlx_whisper
+import numpy as np
 import pyperclip
 import pyautogui
 from pynput import keyboard
@@ -28,8 +29,9 @@ class VoiceRecorderApp(rumps.App):
         # 오디오 설정
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
-        self.RATE = 16000
+        self.RATE = 16000  # preferred; falls back to device default if unsupported
         self.CHUNK = 1024
+        self.actual_rate = self.RATE  # rate the current stream is actually open at
 
         self.is_recording = False
         self.frames = []
@@ -43,6 +45,7 @@ class VoiceRecorderApp(rumps.App):
         # 핫키 이벤트 (pynput 스레드 -> event set -> 메인 타이머 처리)
         self._toggle_event = threading.Event()
         self._lang_event = threading.Event()
+        self._cancel_event = threading.Event()
 
         # 타이머: UI 큐 drain + 이벤트 처리
         self._ui_timer = rumps.Timer(self._drain_mainloop, 0.05)
@@ -55,19 +58,51 @@ class VoiceRecorderApp(rumps.App):
         # 메뉴 구성
         self.build_menu()
 
+        # 모델 워밍업 (cold-start "v" 방지)
+        self._warmup_done = threading.Event()
+        threading.Thread(target=self._warmup_model, daemon=True).start()
+
+    def _warmup_model(self):
+        """첫 transcribe 호출은 MLX 커널 JIT으로 인해 결과가 'v' 같이 망가짐.
+        무음으로는 디코더가 즉시 EOT를 내보내 디코더 커널 JIT이 안 일어나므로,
+        저진폭 노이즈를 사용해 인코더+디코더 경로 모두 워밍업한다."""
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                path = f.name
+            # 2s of low-amplitude noise — exercises the full decoder loop
+            np.random.seed(0)
+            samples = (np.random.randn(32000) * 800).astype(np.int16).tobytes()
+            wf = wave.open(path, "wb")
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(samples)
+            wf.close()
+            print("[warmup] starting…", flush=True)
+            mlx_whisper.transcribe(
+                path,
+                path_or_hf_repo=self.config["model"],
+                language=self.config["language"],
+            )
+            print("[warmup] done", flush=True)
+        except Exception as e:
+            print(f"[warmup] failed: {e}", flush=True)
+        finally:
+            self._warmup_done.set()
+            if path:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+
     # ---------------------------
     # Config
     # ---------------------------
     def load_config(self):
         """설정 파일 로드"""
         default_config = {
-            # 녹음 토글 단축키(기본값 변경)
-            "record_hotkey": "ctrl+shift+m",
-
-            # 언어 스위치(순환) 전용 단축키: cmd+shift+space
-            # 요청대로 녹음 단축키 목록에서 제거하고, 언어 전환용으로 사용
             "lang_hotkey": "cmd+shift+space",
-
             "language": "ko",
             "model": "mlx-community/whisper-large-v3-turbo",
         }
@@ -80,16 +115,13 @@ class VoiceRecorderApp(rumps.App):
         except Exception:
             cfg = {}
 
-        # 구버전 호환: 예전 key가 "hotkey"면 record_hotkey로 흡수
-        if "record_hotkey" not in cfg and "hotkey" in cfg:
-            cfg["record_hotkey"] = cfg["hotkey"]
+        # 녹음 단축키는 right shift로 고정 (이전 설정 무시)
+        cfg.pop("record_hotkey", None)
+        cfg.pop("hotkey", None)
 
-        # merge defaults
         self.config = {**default_config, **cfg}
+        self.config["record_hotkey"] = "rshift"
 
-        # record_hotkey가 없으면 안전하게 기본값
-        if not self.config.get("record_hotkey"):
-            self.config["record_hotkey"] = default_config["record_hotkey"]
         if not self.config.get("lang_hotkey"):
             self.config["lang_hotkey"] = default_config["lang_hotkey"]
 
@@ -126,6 +158,10 @@ class VoiceRecorderApp(rumps.App):
         if self._lang_event.is_set():
             self._lang_event.clear()
             self.cycle_language()
+
+        if self._cancel_event.is_set():
+            self._cancel_event.clear()
+            self.cancel_recording()
 
         # 2) UI 큐 drain
         for _ in range(50):  # 한 tick에 과도 실행 방지
@@ -166,23 +202,6 @@ class VoiceRecorderApp(rumps.App):
 
         self.menu.add(rumps.separator)
 
-        # 단축키 설정(녹음 토글용) — 요청대로 cmd+shift+space 제외
-        hotkey_menu = rumps.MenuItem("녹음 단축키 설정")
-        hotkeys = [
-            ("ctrl+shift+m", "⌃⇧M"),
-            ("cmd+shift+r", "⌘⇧R"),
-            ("alt+space", "⌥Space"),
-            ("cmd+alt+space", "⌘⌥Space"),
-            ("ctrl+shift+space", "⌃⇧Space"),
-        ]
-        for key, label in hotkeys:
-            item = rumps.MenuItem(
-                f"{'✓ ' if record_hk == key else '   '}{label}",
-                callback=lambda sender, k=key: self.set_record_hotkey(k)
-            )
-            hotkey_menu.add(item)
-        self.menu.add(hotkey_menu)
-
         # 언어 설정(직접 선택)
         lang_menu = rumps.MenuItem("전사 언어")
         languages = [
@@ -207,91 +226,97 @@ class VoiceRecorderApp(rumps.App):
         """단축키를 보기 좋게 포맷"""
         if not hotkey:
             return "-"
-        replacements = {
-            "cmd": "⌘", "shift": "⇧", "alt": "⌥",
-            "ctrl": "⌃", "space": "Space", "+": ""
-        }
+        # Order matters: rshift/lshift before shift so they aren't partially replaced.
+        replacements = [
+            ("rshift", "Right ⇧"),
+            ("lshift", "Left ⇧"),
+            ("cmd", "⌘"), ("shift", "⇧"), ("alt", "⌥"),
+            ("ctrl", "⌃"), ("space", "Space"), ("+", ""),
+        ]
         result = hotkey.lower()
-        for k, v in replacements.items():
+        for k, v in replacements:
             result = result.replace(k, v)
         return result
 
     # ---------------------------
     # Hotkey parsing/normalization
     # ---------------------------
-    def _norm_key(self, key):
-        """pynput key를 비교 가능한 표준 형태로 정규화"""
-        # modifiers canonicalize
+    def _key_tokens(self, key):
+        """Tokens contributed by a physical pynput key. A right-shift contributes
+        both 'shift' and 'rshift' so that hotkeys configured with either token match."""
+        if key == keyboard.Key.shift_l:
+            return {"shift", "lshift"}
+        if key == keyboard.Key.shift_r:
+            return {"shift", "rshift"}
+        if key == keyboard.Key.shift:
+            return {"shift"}
         if key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-            return keyboard.Key.ctrl
-        if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
-            return keyboard.Key.shift
+            return {"ctrl"}
         if key in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr):
-            return keyboard.Key.alt
+            return {"alt"}
         if key in (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r):
-            return keyboard.Key.cmd
+            return {"cmd"}
         if key == keyboard.Key.space:
-            return keyboard.Key.space
-
-        # characters
+            return {"space"}
         if isinstance(key, keyboard.KeyCode) and key.char:
-            return ("char", key.char.lower())
+            return {"char:" + key.char.lower()}
+        return set()
 
-        return key
+    _MOD_TOKENS = {"cmd", "shift", "alt", "ctrl", "space", "rshift", "lshift"}
 
-    def parse_hotkey_for_pynput(self, hotkey: str):
-        """pynput용 단축키 파싱 -> 정규화된 키 set 반환"""
-        parts = (hotkey or "").lower().split("+")
-        keys = set()
-        for part in parts:
+    def parse_hotkey(self, hotkey: str):
+        """단축키 문자열을 토큰 set으로 변환 (e.g. 'ctrl+shift+m' -> {'ctrl','shift','char:m'})"""
+        out = set()
+        for part in (hotkey or "").lower().split("+"):
             part = part.strip()
-            if part == "cmd":
-                keys.add(keyboard.Key.cmd)
-            elif part == "shift":
-                keys.add(keyboard.Key.shift)
-            elif part == "alt":
-                keys.add(keyboard.Key.alt)
-            elif part == "ctrl":
-                keys.add(keyboard.Key.ctrl)
-            elif part == "space":
-                keys.add(keyboard.Key.space)
+            if not part:
+                continue
+            if part in self._MOD_TOKENS:
+                out.add(part)
             elif len(part) == 1:
-                keys.add(("char", part))
-        return keys
+                out.add("char:" + part)
+        return out
 
     def setup_hotkey(self):
         """글로벌 단축키 설정 (녹음 토글 + 언어 전환)"""
         if self.hotkey_listener:
             self.hotkey_listener.stop()
 
-        record_keys = self.parse_hotkey_for_pynput(self.config.get("record_hotkey", "ctrl+shift+space"))
-        lang_keys = self.parse_hotkey_for_pynput(self.config.get("lang_hotkey", "cmd+shift+space"))
+        record_keys = self.parse_hotkey(self.config.get("record_hotkey", "ctrl+shift+m"))
+        lang_keys = self.parse_hotkey(self.config.get("lang_hotkey", "cmd+shift+space"))
 
-        current_keys = set()
+        physical = set()  # pynput keys currently held
         fired_record = False
         fired_lang = False
 
+        def current_tokens():
+            t = set()
+            for k in physical:
+                t |= self._key_tokens(k)
+            return t
+
         def on_press(key):
             nonlocal fired_record, fired_lang
-            nk = self._norm_key(key)
-            current_keys.add(nk)
-
-            if (not fired_record) and record_keys.issubset(current_keys):
+            # Esc cancels a recording in progress (drop frames, no transcription)
+            if key == keyboard.Key.esc and self.is_recording:
+                self._cancel_event.set()
+                return
+            physical.add(key)
+            cur = current_tokens()
+            if (not fired_record) and record_keys and record_keys.issubset(cur):
                 fired_record = True
                 self._toggle_event.set()
-
-            if (not fired_lang) and lang_keys.issubset(current_keys):
+            if (not fired_lang) and lang_keys and lang_keys.issubset(cur):
                 fired_lang = True
                 self._lang_event.set()
 
         def on_release(key):
             nonlocal fired_record, fired_lang
-            nk = self._norm_key(key)
-            current_keys.discard(nk)
-
-            if not record_keys.issubset(current_keys):
+            physical.discard(key)
+            cur = current_tokens()
+            if not record_keys.issubset(cur):
                 fired_record = False
-            if not lang_keys.issubset(current_keys):
+            if not lang_keys.issubset(cur):
                 fired_lang = False
 
         self.hotkey_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
@@ -300,14 +325,6 @@ class VoiceRecorderApp(rumps.App):
     # ---------------------------
     # Settings actions
     # ---------------------------
-    def set_record_hotkey(self, hotkey: str):
-        """녹음 단축키 변경"""
-        self.config["record_hotkey"] = hotkey
-        self.save_config()
-        self.setup_hotkey()
-        self.build_menu()
-        self._notify("음성 인식", "", f"녹음 단축키: {self.format_hotkey(hotkey)}")
-
     def set_language(self, lang: str):
         """언어 변경(직접 선택)"""
         self.config["language"] = lang
@@ -364,20 +381,62 @@ class VoiceRecorderApp(rumps.App):
         self.title = f"🔴{LANG_BADGE.get(self.config['language'], self.config['language'].upper())}"
         self.build_menu()
 
-        try:
-            self.stream = self.audio.open(
+        def _device_default_rate():
+            try:
+                info = self.audio.get_default_input_device_info()
+                return int(info.get("defaultSampleRate") or self.RATE)
+            except Exception:
+                return self.RATE
+
+        def _open_stream(rate):
+            return self.audio.open(
                 format=self.FORMAT,
                 channels=self.CHANNELS,
-                rate=self.RATE,
+                rate=rate,
                 input=True,
                 frames_per_buffer=self.CHUNK
-            )
-        except Exception as e:
+            ), rate
+
+        # Try preferred 16k, then device default, recreating PyAudio if CoreAudio is stale.
+        candidates = [self.RATE]
+        dev_rate = _device_default_rate()
+        if dev_rate != self.RATE:
+            candidates.append(dev_rate)
+
+        opened = None
+        last_err = None
+        for _ in range(2):  # second pass after recreating PyAudio
+            for rate in candidates:
+                try:
+                    opened = _open_stream(rate)
+                    break
+                except Exception as e:
+                    last_err = e
+                    print(f"[audio] open rate={rate} failed: {e}", flush=True)
+            if opened:
+                break
+            print("[audio] recreating PyAudio to clear stale CoreAudio state", flush=True)
+            try:
+                self.audio.terminate()
+            except Exception:
+                pass
+            self.audio = pyaudio.PyAudio()
+            # Re-query in case the default device changed
+            candidates = [self.RATE]
+            dev_rate = _device_default_rate()
+            if dev_rate != self.RATE:
+                candidates.append(dev_rate)
+
+        if not opened:
             self.is_recording = False
             self.title = f"🎤{LANG_BADGE.get(self.config['language'], self.config['language'].upper())}"
             self.build_menu()
-            self._notify("오디오 오류", "", str(e)[:120])
+            print(f"[audio] giving up: {last_err}", flush=True)
+            self._notify("오디오 오류", "", str(last_err)[:120])
             return
+
+        self.stream, self.actual_rate = opened
+        print(f"[audio] stream opened at {self.actual_rate} Hz", flush=True)
 
         def record():
             while self.is_recording:
@@ -392,18 +451,10 @@ class VoiceRecorderApp(rumps.App):
         self.record_thread = threading.Thread(target=record, daemon=True)
         self.record_thread.start()
 
-    def stop_recording(self):
-        """녹음 중지 및 전사"""
-        if not self.is_recording:
-            return
-
-        self.is_recording = False
-        self.title = f"⏳{LANG_BADGE.get(self.config['language'], self.config['language'].upper())}"
-        self.build_menu()
-
+    def _close_stream(self):
+        """녹음 스트림 정리"""
         if self.record_thread:
             self.record_thread.join(timeout=1)
-
         if self.stream:
             try:
                 self.stream.stop_stream()
@@ -415,23 +466,47 @@ class VoiceRecorderApp(rumps.App):
                 pass
             self.stream = None
 
+    def stop_recording(self):
+        """녹음 중지 및 전사"""
+        if not self.is_recording:
+            return
+
+        self.is_recording = False
+        self.title = f"⏳{LANG_BADGE.get(self.config['language'], self.config['language'].upper())}"
+        self.build_menu()
+
+        self._close_stream()
+
         if not self.frames:
             self.title = f"🎤{LANG_BADGE.get(self.config['language'], self.config['language'].upper())}"
             self.build_menu()
             return
 
         frames_snapshot = self.frames[:]  # 전사 스레드에 안전하게 전달
+        rate_snapshot = self.actual_rate
         self.frames = []
 
-        threading.Thread(target=self.transcribe_and_paste, args=(frames_snapshot,), daemon=True).start()
+        threading.Thread(target=self.transcribe_and_paste, args=(frames_snapshot, rate_snapshot), daemon=True).start()
+
+    def cancel_recording(self):
+        """Esc로 녹음 취소: 프레임 폐기, 전사하지 않음"""
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self._close_stream()
+        self.frames = []
+        self.title = f"🎤{LANG_BADGE.get(self.config['language'], self.config['language'].upper())}"
+        self.build_menu()
+        print("[record] cancelled (Esc)", flush=True)
 
     # ---------------------------
     # Transcription
     # ---------------------------
-    def transcribe_and_paste(self, frames_snapshot):
+    def transcribe_and_paste(self, frames_snapshot, rate):
         """전사 및 붙여넣기 (백그라운드)"""
         temp_path = None
         try:
+            print(f"[transcribe] frames={len(frames_snapshot)} bytes={sum(len(f) for f in frames_snapshot)}", flush=True)
             # WAV 파일로 저장
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 temp_path = f.name
@@ -439,26 +514,68 @@ class VoiceRecorderApp(rumps.App):
             wf = wave.open(temp_path, "wb")
             wf.setnchannels(self.CHANNELS)
             wf.setsampwidth(self.audio.get_sample_size(self.FORMAT))
-            wf.setframerate(self.RATE)
+            wf.setframerate(rate)
             wf.writeframes(b"".join(frames_snapshot))
             wf.close()
+            print(f"[transcribe] wav={temp_path} rate={rate} lang={self.config['language']} model={self.config['model']}", flush=True)
+
+            if not self._warmup_done.is_set():
+                print("[transcribe] waiting for warmup…", flush=True)
+                self._warmup_done.wait(timeout=120)
+
+            # 무음/짧은 트리거 가드 (whisper 환각 방지)
+            samples = np.frombuffer(b"".join(frames_snapshot), dtype=np.int16)
+            duration = samples.size / float(rate) if rate else 0.0
+            rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) if samples.size else 0.0
+            # Loudest 100ms — catches the case where most of the buffer is quiet but
+            # a stray click/breath bumps RMS above the floor.
+            win = max(1, int(0.1 * rate))
+            peak_rms = 0.0
+            if samples.size >= win:
+                sq = samples.astype(np.float32) ** 2
+                # cheap moving-average via cumulative sum
+                cs = np.cumsum(sq)
+                window_means = (cs[win - 1:] - np.concatenate(([0.0], cs[:-win]))) / win
+                peak_rms = float(np.sqrt(window_means.max()))
+            print(f"[transcribe] dur={duration:.2f}s rms={rms:.0f} peak100ms={peak_rms:.0f}", flush=True)
+            if duration < 0.5:
+                print("[transcribe] skipped (too short)", flush=True)
+                return
+            if rms < 120 or peak_rms < 350:
+                print("[transcribe] skipped (silence)", flush=True)
+                return
 
             # mlx-whisper로 전사
             result = mlx_whisper.transcribe(
                 temp_path,
                 path_or_hf_repo=self.config["model"],
-                language=self.config["language"]
+                language=self.config["language"],
+                hallucination_silence_threshold=0.5,
             )
             text = (result.get("text") or "").strip()
+            print(f"[transcribe] result={text!r}", flush=True)
+
+            # Output-side hallucination filter (last line of defense)
+            HALLUCINATIONS = {
+                "v", "you", ".", "thank you", "thank you.",
+                "thanks for watching", "thanks for watching.",
+                "thanks for watching!", "bye", "bye.",
+            }
+            if text.lower().strip(" .!?,") in HALLUCINATIONS:
+                print(f"[transcribe] skipped (hallucination: {text!r})", flush=True)
+                return
 
             if text:
                 pyperclip.copy(text)
+                print("[transcribe] copied to clipboard", flush=True)
 
                 # 붙여넣기 (메인루프에서 실행하는 게 더 안전)
                 def do_paste():
                     try:
                         pyautogui.hotkey("command", "v")
+                        print("[transcribe] pasted", flush=True)
                     except Exception as e:
+                        print(f"[transcribe] paste error: {e}", flush=True)
                         self._notify("붙여넣기 오류", "", str(e)[:120])
 
                 # 약간 딜레이 후 메인루프에서 수행
@@ -467,9 +584,12 @@ class VoiceRecorderApp(rumps.App):
 
                 self._notify("음성 인식 완료", "", text[:50] + ("..." if len(text) > 50 else ""))
             else:
+                print("[transcribe] empty result", flush=True)
                 self._notify("음성 인식", "", "인식된 텍스트가 없습니다.")
 
         except Exception as e:
+            print(f"[transcribe] ERROR: {e}", flush=True)
+            traceback.print_exc()
             self._notify("오류", "", str(e)[:160])
 
         finally:
