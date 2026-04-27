@@ -4,6 +4,7 @@ numpy
 Pillow
 bleak
 mlx-whisper
+parakeet-mlx
 pyperclip
 pyautogui
 pynput

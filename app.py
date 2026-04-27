@@ -9,6 +9,7 @@ from pathlib import Path
 import queue
 import traceback
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx_whisper
 import numpy as np
@@ -17,6 +18,31 @@ import pyautogui
 from pynput import keyboard
 
 LANG_BADGE = {"ko": "KR", "en": "EN", "vi": "VN", "ja": "JP", "zh": "CH"}
+
+MODELS = [
+    {
+        "key": "whisper-turbo",
+        "label": "Whisper Large V3 Turbo (다국어)",
+        "engine": "whisper",
+        "repo": "mlx-community/whisper-large-v3-turbo",
+        "english_only": False,
+    },
+    {
+        "key": "distil-whisper",
+        "label": "Distil-Whisper Large V3 (영어)",
+        "engine": "whisper",
+        "repo": "mlx-community/distil-whisper-large-v3",
+        "english_only": True,
+    },
+    {
+        "key": "parakeet",
+        "label": "Parakeet TDT 0.6B (영어)",
+        "engine": "parakeet",
+        "repo": "mlx-community/parakeet-tdt-0.6b-v2",
+        "english_only": True,
+    },
+]
+MODELS_BY_KEY = {m["key"]: m for m in MODELS}
 
 class VoiceRecorderApp(rumps.App):
     def __init__(self):
@@ -58,19 +84,35 @@ class VoiceRecorderApp(rumps.App):
         # 메뉴 구성
         self.build_menu()
 
-        # 모델 워밍업 (cold-start "v" 방지)
+        # 엔진/모델 상태 — 모든 MLX 작업은 단일 워커 스레드에서 실행
+        # (MLX의 GPU stream은 thread-local이므로 cached parakeet model을
+        # 로드한 스레드 외 다른 스레드에서 호출하면 RuntimeError 발생)
+        self._parakeet_models = {}  # repo -> loaded model (cached)
+        self._engine_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine")
+
+        # 모델 워밍업 (cold-start 방지)
         self._warmup_done = threading.Event()
-        threading.Thread(target=self._warmup_model, daemon=True).start()
+        self._engine_executor.submit(self._warmup_model)
+
+    def _active_model(self):
+        return MODELS_BY_KEY[self.config["model_key"]]
+
+    def _get_parakeet(self, repo):
+        """Lazily load + cache a parakeet model. MUST be called from the engine thread."""
+        if repo not in self._parakeet_models:
+            import parakeet_mlx
+            print(f"[parakeet] loading {repo}…", flush=True)
+            self._parakeet_models[repo] = parakeet_mlx.from_pretrained(repo)
+            print("[parakeet] loaded", flush=True)
+        return self._parakeet_models[repo]
 
     def _warmup_model(self):
-        """첫 transcribe 호출은 MLX 커널 JIT으로 인해 결과가 'v' 같이 망가짐.
-        무음으로는 디코더가 즉시 EOT를 내보내 디코더 커널 JIT이 안 일어나므로,
-        저진폭 노이즈를 사용해 인코더+디코더 경로 모두 워밍업한다."""
+        """현재 엔진의 첫 transcribe 호출은 MLX 커널 JIT으로 인해 결과가 망가질 수 있음.
+        저진폭 노이즈로 인코더+디코더 경로 모두 워밍업한다."""
         path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 path = f.name
-            # 2s of low-amplitude noise — exercises the full decoder loop
             np.random.seed(0)
             samples = (np.random.randn(32000) * 800).astype(np.int16).tobytes()
             wf = wave.open(path, "wb")
@@ -79,13 +121,11 @@ class VoiceRecorderApp(rumps.App):
             wf.setframerate(16000)
             wf.writeframes(samples)
             wf.close()
-            print("[warmup] starting…", flush=True)
-            mlx_whisper.transcribe(
-                path,
-                path_or_hf_repo=self.config["model"],
-                language=self.config["language"],
-            )
-            print("[warmup] done", flush=True)
+
+            m = self._active_model()
+            print(f"[warmup] {m['key']} starting…", flush=True)
+            self._run_engine(m, path, language=self.config["language"])
+            print(f"[warmup] {m['key']} done", flush=True)
         except Exception as e:
             print(f"[warmup] failed: {e}", flush=True)
         finally:
@@ -96,6 +136,23 @@ class VoiceRecorderApp(rumps.App):
                 except Exception:
                     pass
 
+    def _run_engine(self, model_def, wav_path, language):
+        """엔진 디스패치. 반환: 결과 텍스트(문자열)."""
+        if model_def["engine"] == "whisper":
+            lang = "en" if model_def["english_only"] else language
+            result = mlx_whisper.transcribe(
+                wav_path,
+                path_or_hf_repo=model_def["repo"],
+                language=lang,
+                hallucination_silence_threshold=0.5,
+            )
+            return (result.get("text") or "").strip()
+        if model_def["engine"] == "parakeet":
+            model = self._get_parakeet(model_def["repo"])
+            result = model.transcribe(wav_path)
+            return (getattr(result, "text", "") or "").strip()
+        raise ValueError(f"unknown engine: {model_def['engine']}")
+
     # ---------------------------
     # Config
     # ---------------------------
@@ -104,7 +161,7 @@ class VoiceRecorderApp(rumps.App):
         default_config = {
             "lang_hotkey": "cmd+shift+space",
             "language": "ko",
-            "model": "mlx-community/whisper-large-v3-turbo",
+            "model_key": "whisper-turbo",
         }
 
         cfg = {}
@@ -118,10 +175,19 @@ class VoiceRecorderApp(rumps.App):
         # 녹음 단축키는 right shift로 고정 (이전 설정 무시)
         cfg.pop("record_hotkey", None)
         cfg.pop("hotkey", None)
+        # 구버전 호환: 'model' (repo 문자열) → 'model_key'
+        if "model_key" not in cfg and "model" in cfg:
+            for m in MODELS:
+                if m["repo"] == cfg["model"]:
+                    cfg["model_key"] = m["key"]
+                    break
+        cfg.pop("model", None)
 
         self.config = {**default_config, **cfg}
         self.config["record_hotkey"] = "rshift"
 
+        if self.config.get("model_key") not in MODELS_BY_KEY:
+            self.config["model_key"] = default_config["model_key"]
         if not self.config.get("lang_hotkey"):
             self.config["lang_hotkey"] = default_config["lang_hotkey"]
 
@@ -201,6 +267,17 @@ class VoiceRecorderApp(rumps.App):
         ))
 
         self.menu.add(rumps.separator)
+
+        # 모델 선택
+        active_key = self.config.get("model_key", "whisper-turbo")
+        model_menu = rumps.MenuItem("모델")
+        for m in MODELS:
+            item = rumps.MenuItem(
+                f"{'✓ ' if active_key == m['key'] else '   '}{m['label']}",
+                callback=lambda sender, k=m["key"]: self.set_model(k),
+            )
+            model_menu.add(item)
+        self.menu.add(model_menu)
 
         # 언어 설정(직접 선택)
         lang_menu = rumps.MenuItem("전사 언어")
@@ -325,6 +402,19 @@ class VoiceRecorderApp(rumps.App):
     # ---------------------------
     # Settings actions
     # ---------------------------
+    def set_model(self, key: str):
+        """모델 변경. 워밍업 이벤트를 리셋하고 새 엔진으로 다시 워밍업한다."""
+        if key not in MODELS_BY_KEY or key == self.config.get("model_key"):
+            return
+        self.config["model_key"] = key
+        self.save_config()
+        self.build_menu()
+        m = MODELS_BY_KEY[key]
+        self._notify("음성 인식", "", f"모델: {m['label']}")
+        # 새 엔진을 엔진 스레드에서 다시 워밍업
+        self._warmup_done.clear()
+        self._engine_executor.submit(self._warmup_model)
+
     def set_language(self, lang: str):
         """언어 변경(직접 선택)"""
         self.config["language"] = lang
@@ -517,7 +607,8 @@ class VoiceRecorderApp(rumps.App):
             wf.setframerate(rate)
             wf.writeframes(b"".join(frames_snapshot))
             wf.close()
-            print(f"[transcribe] wav={temp_path} rate={rate} lang={self.config['language']} model={self.config['model']}", flush=True)
+            m = self._active_model()
+            print(f"[transcribe] wav={temp_path} rate={rate} lang={self.config['language']} model={m['key']}", flush=True)
 
             if not self._warmup_done.is_set():
                 print("[transcribe] waiting for warmup…", flush=True)
@@ -545,14 +636,10 @@ class VoiceRecorderApp(rumps.App):
                 print("[transcribe] skipped (silence)", flush=True)
                 return
 
-            # mlx-whisper로 전사
-            result = mlx_whisper.transcribe(
-                temp_path,
-                path_or_hf_repo=self.config["model"],
-                language=self.config["language"],
-                hallucination_silence_threshold=0.5,
-            )
-            text = (result.get("text") or "").strip()
+            # MLX 작업은 단일 엔진 스레드에서 수행 (thread-local stream 제약)
+            text = self._engine_executor.submit(
+                self._run_engine, m, temp_path, self.config["language"]
+            ).result()
             print(f"[transcribe] result={text!r}", flush=True)
 
             # Output-side hallucination filter (last line of defense)
@@ -628,6 +715,11 @@ class VoiceRecorderApp(rumps.App):
 
         try:
             self.audio.terminate()
+        except Exception:
+            pass
+
+        try:
+            self._engine_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
 
