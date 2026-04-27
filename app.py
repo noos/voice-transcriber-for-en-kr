@@ -17,7 +17,7 @@ import pyperclip
 import pyautogui
 from pynput import keyboard
 
-LANG_BADGE = {"ko": "KR", "en": "EN", "vi": "VN", "ja": "JP", "zh": "CH"}
+LANG_BADGE = {"ko": "KR", "en": "EN"}
 
 MODELS = [
     {
@@ -28,13 +28,6 @@ MODELS = [
         "english_only": False,
     },
     {
-        "key": "distil-whisper",
-        "label": "Distil-Whisper Large V3 (영어)",
-        "engine": "whisper",
-        "repo": "mlx-community/distil-whisper-large-v3",
-        "english_only": True,
-    },
-    {
         "key": "parakeet",
         "label": "Parakeet TDT 0.6B (영어)",
         "engine": "parakeet",
@@ -43,6 +36,14 @@ MODELS = [
     },
 ]
 MODELS_BY_KEY = {m["key"]: m for m in MODELS}
+
+# Profiles bundle a language and a model so the user picks one thing in the UI
+# and can't accidentally pair (e.g.) Korean with Parakeet.
+PROFILES = [
+    {"key": "ko-whisper",  "label": "한국어 (Whisper Turbo)", "language": "ko", "model_key": "whisper-turbo"},
+    {"key": "en-parakeet", "label": "English (Parakeet)",      "language": "en", "model_key": "parakeet"},
+]
+PROFILES_BY_KEY = {p["key"]: p for p in PROFILES}
 
 class VoiceRecorderApp(rumps.App):
     def __init__(self):
@@ -96,6 +97,26 @@ class VoiceRecorderApp(rumps.App):
 
     def _active_model(self):
         return MODELS_BY_KEY[self.config["model_key"]]
+
+    def _active_profile(self):
+        """Find the profile matching the current (language, model_key) pair, else fall back to PROFILES[0]."""
+        lang = self.config.get("language")
+        mk = self.config.get("model_key")
+        for p in PROFILES:
+            if p["language"] == lang and p["model_key"] == mk:
+                return p
+        return PROFILES[0]
+
+    def _refresh_title(self):
+        """타이틀 배지 갱신 (현재 언어 + 녹음/전사 상태 반영)"""
+        badge = LANG_BADGE.get(self.config["language"], self.config["language"].upper())
+        cur = str(self.title)
+        if cur.startswith("🔴"):
+            self.title = f"🔴{badge}"
+        elif cur.startswith("⏳"):
+            self.title = f"⏳{badge}"
+        else:
+            self.title = f"🎤{badge}"
 
     def _get_parakeet(self, repo):
         """Lazily load + cache a parakeet model. MUST be called from the engine thread."""
@@ -223,7 +244,7 @@ class VoiceRecorderApp(rumps.App):
 
         if self._lang_event.is_set():
             self._lang_event.clear()
-            self.cycle_language()
+            self.cycle_profile()
 
         if self._cancel_event.is_set():
             self._cancel_event.clear()
@@ -250,7 +271,7 @@ class VoiceRecorderApp(rumps.App):
 
         record_hk = self.config.get("record_hotkey", "")
         lang_hk = self.config.get("lang_hotkey", "")
-        lang_code = self.config.get("language", "ko")
+        active = self._active_profile()
 
         # 녹음 상태
         status = "🔴 녹음 중지" if self.is_recording else "녹음 시작"
@@ -260,41 +281,23 @@ class VoiceRecorderApp(rumps.App):
         )
         self.menu.add(self.status_item)
 
-        # 언어 스위치 안내 (고정 단축키)
+        # 프로필 스위치 안내 (고정 단축키)
         self.menu.add(rumps.MenuItem(
-            f"언어 전환: {self.format_hotkey(lang_hk)}  (현재: {lang_code})",
+            f"프로필 전환: {self.format_hotkey(lang_hk)}  (현재: {active['label']})",
             callback=None
         ))
 
         self.menu.add(rumps.separator)
 
-        # 모델 선택
-        active_key = self.config.get("model_key", "whisper-turbo")
-        model_menu = rumps.MenuItem("모델")
-        for m in MODELS:
+        # 프로필 선택 (언어+모델 묶음)
+        profile_menu = rumps.MenuItem("프로필")
+        for p in PROFILES:
             item = rumps.MenuItem(
-                f"{'✓ ' if active_key == m['key'] else '   '}{m['label']}",
-                callback=lambda sender, k=m["key"]: self.set_model(k),
+                f"{'✓ ' if active['key'] == p['key'] else '   '}{p['label']}",
+                callback=lambda sender, k=p["key"]: self.set_profile(k),
             )
-            model_menu.add(item)
-        self.menu.add(model_menu)
-
-        # 언어 설정(직접 선택)
-        lang_menu = rumps.MenuItem("전사 언어")
-        languages = [
-            ("ko", "한국어"),
-            ("en", "English"),
-            ("ja", "日本語"),
-            ("zh", "中文"),
-            ("vi", "Tiếng Việt"),
-        ]
-        for code, name in languages:
-            item = rumps.MenuItem(
-                f"{'✓ ' if lang_code == code else '   '}{name}",
-                callback=lambda sender, c=code: self.set_language(c)
-            )
-            lang_menu.add(item)
-        self.menu.add(lang_menu)
+            profile_menu.add(item)
+        self.menu.add(profile_menu)
 
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("종료", callback=self.quit_app))
@@ -402,53 +405,33 @@ class VoiceRecorderApp(rumps.App):
     # ---------------------------
     # Settings actions
     # ---------------------------
-    def set_model(self, key: str):
-        """모델 변경. 워밍업 이벤트를 리셋하고 새 엔진으로 다시 워밍업한다."""
-        if key not in MODELS_BY_KEY or key == self.config.get("model_key"):
+    def set_profile(self, key: str):
+        """프로필(언어+모델) 변경. 모델이 바뀌면 워밍업 다시 수행."""
+        if key not in PROFILES_BY_KEY:
             return
-        self.config["model_key"] = key
+        p = PROFILES_BY_KEY[key]
+        if p["language"] == self.config.get("language") and p["model_key"] == self.config.get("model_key"):
+            return
+        model_changed = p["model_key"] != self.config.get("model_key")
+        self.config["language"] = p["language"]
+        self.config["model_key"] = p["model_key"]
         self.save_config()
+        self._refresh_title()
         self.build_menu()
-        m = MODELS_BY_KEY[key]
-        self._notify("음성 인식", "", f"모델: {m['label']}")
-        # 새 엔진을 엔진 스레드에서 다시 워밍업
-        self._warmup_done.clear()
-        self._engine_executor.submit(self._warmup_model)
+        self._notify("음성 인식", "", f"프로필: {p['label']}")
+        if model_changed:
+            self._warmup_done.clear()
+            self._engine_executor.submit(self._warmup_model)
 
-    def set_language(self, lang: str):
-        """언어 변경(직접 선택)"""
-        self.config["language"] = lang
-        self.save_config()
-        self.build_menu()
-        lang_names = {
-            "ko": "한국어",
-            "en": "English",
-            "ja": "日本語",
-            "zh": "中文",
-            "vi": "Tiếng Việt",
-        }
-        self._notify("음성 인식", "", f"전사 언어: {lang_names.get(lang, lang)}")
-
-    def cycle_language(self):
-        """언어 순환 전환 (cmd+shift+space)"""
-        order = ["ko", "en", "vi", "ja", "zh"]  # 원하는 순서로 조정 가능
-        cur = self.config.get("language", "ko")
+    def cycle_profile(self):
+        """프로필 순환 전환 (cmd+shift+space)"""
+        cur_key = self._active_profile()["key"]
+        keys = [p["key"] for p in PROFILES]
         try:
-            nxt = order[(order.index(cur) + 1) % len(order)]
+            nxt = keys[(keys.index(cur_key) + 1) % len(keys)]
         except ValueError:
-            nxt = "ko"
-
-        self.config["language"] = nxt
-        self.save_config()
-        self.build_menu()
-        self._notify("음성 인식", "", f"전사 언어 전환: {nxt}")
-        badge = LANG_BADGE.get(self.config["language"], self.config["language"].upper())
-        if str(self.title).startswith("🔴"):
-            self.title = f"🔴{badge}"
-        elif str(self.title).startswith("⏳"):
-            self.title = f"⏳{badge}"
-        else:
-            self.title = f"🎤{badge}"
+            nxt = keys[0]
+        self.set_profile(nxt)
     # ---------------------------
     # Recording
     # ---------------------------
